@@ -535,6 +535,7 @@ CopyFrom(CopyFromState cstate)
 	ExprContext *econtext;
 	TupleTableSlot *singleslot = NULL;
 	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
 
 	PartitionTupleRouting *proute = NULL;
 	ErrorContextCallback errcallback;
@@ -548,6 +549,17 @@ CopyFrom(CopyFromState cstate)
 	bool		has_before_insert_row_trig;
 	bool		has_instead_insert_row_trig;
 	bool		leafpart_use_multi_insert = false;
+
+	/* variables for copy from ignore_errors option */
+#define			REPLAY_BUFFER_SIZE 3
+	HeapTuple		replay_buffer[REPLAY_BUFFER_SIZE];
+	HeapTuple 		replay_tuple;
+	int 			saved_tuples = 0;
+	int				replayed_tuples = 0;
+	bool			replay_is_active = false;
+	bool			begin_subtransaction = true;
+	bool            find_error = false;
+	bool			last_replaying = false;
 
 	Assert(cstate->rel);
 	Assert(list_length(cstate->range_table) == 1);
@@ -855,9 +867,129 @@ CopyFrom(CopyFromState cstate)
 
 		ExecClearTuple(myslot);
 
-		/* Directly store the values/nulls array in the slot */
-		if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
-			break;
+		/*
+		 * If option IGNORE_ERRORS is enabled, COPY skip rows with errors.
+		 * NextCopyFrom() directly store the values/nulls array in the slot.
+		 */
+		if (cstate->opts.ignore_errors)
+		{
+			bool valid_row = true;
+			bool skip_row = false;
+
+			PG_TRY();
+			{
+				if (!replay_is_active)
+				{
+					if (begin_subtransaction)
+					{
+						BeginInternalSubTransaction(NULL);
+						CurrentResourceOwner = oldowner;
+					}
+
+					if (saved_tuples < REPLAY_BUFFER_SIZE)
+					{
+						valid_row = NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull);
+						if (valid_row)
+						{
+							if (insertMethod == CIM_SINGLE)
+							{
+								MemoryContextSwitchTo(oldcontext);
+
+								replay_tuple = heap_form_tuple(RelationGetDescr(cstate->rel), myslot->tts_values, myslot->tts_isnull);
+								replay_buffer[saved_tuples++] = replay_tuple;
+
+								if (find_error)
+									skip_row = true;
+							}
+
+							begin_subtransaction = false;
+						}
+					}
+					else
+					{
+						ReleaseCurrentSubTransaction();
+
+						replay_is_active = true;
+						begin_subtransaction = true;
+						skip_row = true;
+					}
+				}
+				else
+				{
+					if (insertMethod == CIM_SINGLE && find_error && replayed_tuples < saved_tuples)
+					{
+						heap_deform_tuple(replay_buffer[replayed_tuples], RelationGetDescr(cstate->rel), myslot->tts_values, myslot->tts_isnull);
+						replayed_tuples++;
+					}
+					else
+					{
+						MemSet(replay_buffer, 0, REPLAY_BUFFER_SIZE * sizeof(HeapTuple));
+						saved_tuples = 0;
+						replayed_tuples = 0;
+
+						replay_is_active = false;
+						find_error = false;
+						skip_row = true;
+					}
+				}
+			}
+			PG_CATCH();
+			{
+				ErrorData *errdata;
+				MemoryContextSwitchTo(oldcontext);
+				errdata = CopyErrorData();
+
+				switch (errdata->sqlerrcode)
+				{
+					case ERRCODE_BAD_COPY_FILE_FORMAT:
+					case ERRCODE_INVALID_TEXT_REPRESENTATION:
+						RollbackAndReleaseCurrentSubTransaction();
+						elog(WARNING, "%s", errdata->context);
+
+						begin_subtransaction = true;
+						find_error = true;
+						skip_row = true;
+
+						break;
+
+					default:
+						PG_RE_THROW();
+				}
+
+				FlushErrorState();
+				FreeErrorData(errdata);
+				errdata = NULL;
+			}
+			PG_END_TRY();
+
+			if (!valid_row)
+			{
+				if (!last_replaying)
+				{
+					ReleaseCurrentSubTransaction();
+					CurrentResourceOwner = oldowner;
+
+					if (replayed_tuples < saved_tuples)
+					{
+						replay_is_active = true;
+						skip_row = true;
+						last_replaying = true;
+					}
+					else
+						break;
+				}
+				else
+					break;
+			}
+
+			if (skip_row)
+				continue;
+		}
+		else
+		{
+			if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
+				break;
+		}
 
 		ExecStoreVirtualTuple(myslot);
 
